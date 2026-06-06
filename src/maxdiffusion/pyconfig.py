@@ -169,6 +169,10 @@ class _HyperParameters:
           max_logging.log(
               f"Warning: Try setting num_inference_steps to less than 10 steps when using CausVid, currently you are setting {num_inference_steps} steps."
           )
+      elif os.path.isfile(transformer_pretrained_model_name_or_path) and transformer_pretrained_model_name_or_path.endswith(
+          (".pt", ".pth")
+      ):
+        max_logging.log(f"Using local Wan transformer checkpoint: {transformer_pretrained_model_name_or_path}")
       else:
         raise ValueError(f"{transformer_pretrained_model_name_or_path} transformer model is not supported for Wan 2.1")
     if "use_qwix_quantization" not in raw_keys:
@@ -190,7 +194,7 @@ class _HyperParameters:
     else:
       global_batch_size_to_load = int(num_devices * per_device_batch_size)
 
-    global_batch_size_to_train_on = int(num_devices * per_device_batch_size)
+    global_batch_size_to_train_on = max(1, int(num_devices * per_device_batch_size))
     return global_batch_size_to_load, global_batch_size_to_train_on
 
   @staticmethod

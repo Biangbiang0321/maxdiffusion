@@ -238,7 +238,14 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
       # timesteps = jnp.array([_sigma_to_t_jax(s, log_sigmas_full) for s in sigmas]).round().astype(jnp.int64)
       raise NotImplementedError("`use_beta_sigmas` is not implemented in JAX version yet.")
     if self.config.use_flow_sigmas:
-      sigmas = jnp.linspace(1.0, 1.0 / self.config.num_train_timesteps, num_inference_steps + 1)[:-1]
+      # Match Wan/Causal-Forcing FlowUniPC: scheduler initialization defines
+      # sigma_max=1 - 1/num_train_timesteps and sigma_min=0, then inference
+      # applies the flow shift to a linspace over that closed interval.
+      sigmas = jnp.linspace(
+          1.0 - 1.0 / self.config.num_train_timesteps,
+          0.0,
+          num_inference_steps + 1,
+      )[:-1]
       sigmas = self.config.flow_shift * sigmas / (1 + (self.config.flow_shift - 1) * sigmas)
       eps = 1e-6
       sigmas = sigmas.at[0].set(jnp.where(jnp.abs(sigmas[0] - 1.0) < eps, sigmas[0] - eps, sigmas[0]))

@@ -215,12 +215,40 @@ class AttentionTest(unittest.TestCase):
         attention_kernel="tokamax_flash",
     )
     self.assertEqual(cross_attention_block_sizes.block_q, 16)
-    self.assertEqual(cross_attention_block_sizes.block_kv, 513)
-    self.assertEqual(cross_attention_block_sizes.block_kv_compute, 513)
-    self.assertEqual(cross_attention_block_sizes.block_kv_dkv_compute, 257)
+    self.assertEqual(cross_attention_block_sizes.block_kv, 128)
+    self.assertEqual(cross_attention_block_sizes.block_kv_compute, 128)
+    self.assertEqual(cross_attention_block_sizes.block_kv_dkv_compute, 128)
     self.assertIsNone(cross_attention_block_sizes.block_q_dq)
     self.assertIsNone(cross_attention_block_sizes.block_kv_dq)
     self.assertTrue(cross_attention_block_sizes.use_fused_bwd_kernel)
+
+  def test_select_flash_block_sizes_keeps_tokamax_kv_block_bounded_for_ar_cache(self):
+    configured_block_sizes = splash_attention_kernel.BlockSizes(
+        block_q=512,
+        block_kv_compute=512,
+        block_kv=512,
+        block_q_dkv=512,
+        block_kv_dkv=512,
+        block_kv_dkv_compute=512,
+        block_q_dq=512,
+        block_kv_dq=512,
+        use_fused_bwd_kernel=False,
+    )
+    query = jnp.zeros((1, 12, 1560, 128), dtype=jnp.bfloat16)
+    key = jnp.zeros((1, 12, 3120, 128), dtype=jnp.bfloat16)
+
+    block_sizes = _select_flash_block_sizes(
+        query=query,
+        key=key,
+        flash_block_sizes=configured_block_sizes,
+        dtype=jnp.bfloat16,
+        attention_kernel="tokamax_flash",
+    )
+
+    self.assertEqual(block_sizes.block_kv, 512)
+    self.assertEqual(block_sizes.block_kv_compute, 512)
+    self.assertEqual(block_sizes.block_kv_dkv_compute, 512)
+    self.assertTrue(block_sizes.use_fused_bwd_kernel)
 
   def test_ulysses_attention_round_trips_query_when_heads_are_divisible(self):
     """Ulysses attention should preserve the query layout after its collectives."""

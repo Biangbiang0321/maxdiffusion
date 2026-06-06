@@ -25,6 +25,12 @@ from ...schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepSche
 import numpy as np
 import time
 from ... import max_utils
+from .wan_framewise_ar_utils import (
+    append_self_kv_cache,
+    make_framewise_ar_timestep,
+    replace_latent_frame_block,
+    reset_scheduler_state_for_ar_block,
+)
 
 
 class WanPipeline2_1(WanPipeline):
@@ -228,6 +234,21 @@ def run_inference_2_1(
   """
   do_cfg = guidance_scale > 1.0
   bsz = latents.shape[0]
+
+  if getattr(config, "framewise_ar_inference", False):
+    return run_framewise_ar_inference_2_1(
+        graphdef=graphdef,
+        sharded_state=sharded_state,
+        rest_of_state=rest_of_state,
+        latents=latents,
+        prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        scheduler=scheduler,
+        scheduler_state=scheduler_state,
+        config=config,
+    )
 
   # Resolution-dependent CFG cache config (FasterCache / MixCache guidance)
   if height >= 720:
@@ -475,3 +496,168 @@ def run_inference_2_1(
         profiler.stop()
 
   return latents
+
+
+def run_framewise_ar_inference_2_1(
+    graphdef,
+    sharded_state,
+    rest_of_state,
+    latents: jnp.array,
+    prompt_embeds: jnp.array,
+    negative_prompt_embeds: jnp.array,
+    guidance_scale: float,
+    num_inference_steps: int,
+    scheduler: FlaxUniPCMultistepScheduler,
+    scheduler_state,
+    config=None,
+):
+  """Official Causal Forcing Stage 1 style blockwise AR denoising loop."""
+  do_cfg = guidance_scale > 1.0
+  bsz = latents.shape[0]
+  latent_num_frames = latents.shape[2]
+  num_frames_per_block = int(getattr(config, "framewise_ar_num_frames_per_block", 1))
+  use_self_kv_cache = bool(getattr(config, "framewise_ar_use_self_kv_cache", True))
+  debug_stats = bool(getattr(config, "framewise_ar_debug_stats", False))
+
+  if num_frames_per_block <= 0:
+    raise ValueError(f"framewise_ar_num_frames_per_block must be positive, got {num_frames_per_block}.")
+  if latent_num_frames % num_frames_per_block != 0:
+    raise ValueError(
+        f"Latent frame count {latent_num_frames} must be divisible by framewise_ar_num_frames_per_block="
+        f"{num_frames_per_block}."
+    )
+  if not use_self_kv_cache:
+    raise NotImplementedError("Causal Forcing Stage 1 AR inference currently requires self KV cache.")
+
+  transformer_obj = nnx.merge(graphdef, sharded_state, rest_of_state)
+  generated_latents = latents
+  self_kv_cache_cond = None
+  self_kv_cache_uncond = None
+
+  def _print_stats(label, value):
+    value = value.astype(jnp.float32)
+    mean = jnp.mean(value)
+    std = jnp.std(value)
+    vmin = jnp.min(value)
+    vmax = jnp.max(value)
+    mean, std, vmin, vmax = jax.block_until_ready((mean, std, vmin, vmax))
+    print(
+        f"{label}: mean={float(mean):.6f}, std={float(std):.6f}, min={float(vmin):.6f}, max={float(vmax):.6f}",
+        flush=True,
+    )
+
+  for block_start in range(0, latent_num_frames, num_frames_per_block):
+    current_num_frames = min(num_frames_per_block, latent_num_frames - block_start)
+    current_latents = generated_latents[:, :, block_start : block_start + current_num_frames]
+    if debug_stats and block_start < 3:
+      _print_stats(f"ar/block_{block_start}/initial_latents", current_latents)
+
+    dummy_hidden_states = jnp.zeros(
+        (
+            current_latents.shape[0],
+            current_latents.shape[2],
+            current_latents.shape[3],
+            current_latents.shape[4],
+            current_latents.shape[1],
+        ),
+        dtype=current_latents.dtype,
+    )
+    rotary_emb = transformer_obj.rope(dummy_hidden_states, frame_start=block_start)
+
+    block_scheduler_state = reset_scheduler_state_for_ar_block(
+        scheduler,
+        scheduler_state,
+        num_inference_steps,
+        current_latents.shape,
+    )
+    for step in range(num_inference_steps):
+      t = jnp.array(block_scheduler_state.timesteps, dtype=jnp.int32)[step]
+      timestep = make_framewise_ar_timestep(t, bsz, current_num_frames)
+      noise_pred_cond, _ = transformer_forward_pass(
+          graphdef,
+          sharded_state,
+          rest_of_state,
+          current_latents,
+          timestep,
+          prompt_embeds,
+          do_classifier_free_guidance=False,
+          guidance_scale=guidance_scale,
+          self_kv_cache=self_kv_cache_cond,
+          rotary_emb=rotary_emb,
+          encoder_attention_mask=None,
+      )
+      if do_cfg:
+        noise_pred_uncond, _ = transformer_forward_pass(
+            graphdef,
+            sharded_state,
+            rest_of_state,
+            current_latents,
+            timestep,
+            negative_prompt_embeds,
+            do_classifier_free_guidance=False,
+            guidance_scale=guidance_scale,
+            self_kv_cache=self_kv_cache_uncond,
+            rotary_emb=rotary_emb,
+            encoder_attention_mask=None,
+        )
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+      else:
+        noise_pred = noise_pred_cond
+
+      if debug_stats and block_start < 3 and step in (0, num_inference_steps - 1):
+        _print_stats(f"ar/block_{block_start}/step_{step}/noise_pred", noise_pred)
+      current_latents, block_scheduler_state = scheduler.step(
+          block_scheduler_state,
+          noise_pred,
+          t,
+          current_latents,
+          return_dict=False,
+      )
+      if debug_stats and block_start < 3 and step in (0, num_inference_steps - 1):
+        _print_stats(f"ar/block_{block_start}/step_{step}/latents", current_latents)
+
+    generated_latents = replace_latent_frame_block(
+        generated_latents,
+        current_latents,
+        block_start,
+        current_num_frames,
+    )
+
+    clean_timestep = jnp.zeros((bsz, current_num_frames), dtype=jnp.float32)
+    _, _, present_self_kv_cond = transformer_forward_pass(
+        graphdef,
+        sharded_state,
+        rest_of_state,
+        current_latents,
+        clean_timestep,
+        prompt_embeds,
+        do_classifier_free_guidance=False,
+        guidance_scale=guidance_scale,
+        self_kv_cache=self_kv_cache_cond,
+        return_self_kv=True,
+        rotary_emb=rotary_emb,
+        encoder_attention_mask=None,
+    )
+    self_kv_cache_cond = append_self_kv_cache(self_kv_cache_cond, present_self_kv_cond)
+    if debug_stats and block_start < 3:
+      key_cache, _ = self_kv_cache_cond
+      _print_stats(f"ar/block_{block_start}/self_kv_cache_cond_key", key_cache)
+
+    if do_cfg:
+      _, _, present_self_kv_uncond = transformer_forward_pass(
+          graphdef,
+          sharded_state,
+          rest_of_state,
+          current_latents,
+          clean_timestep,
+          negative_prompt_embeds,
+          do_classifier_free_guidance=False,
+          guidance_scale=guidance_scale,
+          self_kv_cache=self_kv_cache_uncond,
+          return_self_kv=True,
+          rotary_emb=rotary_emb,
+          encoder_attention_mask=None,
+      )
+      self_kv_cache_uncond = append_self_kv_cache(self_kv_cache_uncond, present_self_kv_uncond)
+
+  return generated_latents

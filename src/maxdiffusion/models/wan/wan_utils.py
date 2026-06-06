@@ -64,6 +64,8 @@ def rename_for_nnx(key):
 
 def rename_for_custom_trasformer(key):
   renamed_pt_key = key.replace("model.diffusion_model.", "")
+  if renamed_pt_key.startswith("model."):
+    renamed_pt_key = renamed_pt_key[len("model.") :]
 
   renamed_pt_key = renamed_pt_key.replace("head.modulation", "scale_shift_table")
   renamed_pt_key = renamed_pt_key.replace("head.head", "proj_out")
@@ -83,9 +85,43 @@ def rename_for_custom_trasformer(key):
   renamed_pt_key = renamed_pt_key.replace("ffn_0", "ffn.act_fn.proj")
   renamed_pt_key = renamed_pt_key.replace("ffn_2", "ffn.proj_out")
   renamed_pt_key = renamed_pt_key.replace(".modulation", ".scale_shift_table")
+  if renamed_pt_key.startswith("blocks.") and ".scale_shift_table" in renamed_pt_key:
+    renamed_pt_key = renamed_pt_key.replace(".scale_shift_table", ".adaln_scale_shift_table")
   renamed_pt_key = renamed_pt_key.replace("norm3", "norm2.layer_norm")
 
   return renamed_pt_key
+
+
+def _shape_of_state_value(value):
+  return value.value.shape if hasattr(value, "value") else value.shape
+
+
+def _validate_causal_forcing_state_dict(expected_pytree: dict, loaded_flat_state_dict: dict, checkpoint_path: str):
+  expected_flat = flatten_dict(expected_pytree)
+  expected_keys = set(expected_flat.keys())
+  loaded_keys = set(loaded_flat_state_dict.keys())
+  missing_keys = sorted(expected_keys - loaded_keys)
+  unexpected_keys = sorted(loaded_keys - expected_keys)
+  shape_mismatches = []
+
+  for key in sorted(expected_keys & loaded_keys):
+    expected_shape = _shape_of_state_value(expected_flat[key])
+    loaded_shape = loaded_flat_state_dict[key].shape
+    if expected_shape != loaded_shape:
+      shape_mismatches.append((key, expected_shape, loaded_shape))
+
+  if missing_keys or unexpected_keys or shape_mismatches:
+    details = [
+        f"Failed to strictly validate Causal Forcing checkpoint {checkpoint_path}.",
+        f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}, shape_mismatches={len(shape_mismatches)}",
+    ]
+    if missing_keys:
+      details.append(f"first missing keys: {missing_keys[:10]}")
+    if unexpected_keys:
+      details.append(f"first unexpected keys: {unexpected_keys[:10]}")
+    if shape_mismatches:
+      details.append(f"first shape mismatches: {shape_mismatches[:10]}")
+    raise ValueError("\n".join(details))
 
 
 def get_key_and_value(pt_tuple_key, tensor, flax_state_dict, random_flax_state_dict, scan_layers, num_layers=40):
@@ -265,6 +301,64 @@ def load_causvid_transformer(
       return flax_state_dict
 
 
+def _extract_causal_forcing_generator_state_dict(loaded_checkpoint):
+  """Returns the generator state dict from an official Causal Forcing checkpoint."""
+  if not isinstance(loaded_checkpoint, dict):
+    raise ValueError("Causal Forcing checkpoint must be a dict-like object.")
+
+  if "generator" in loaded_checkpoint:
+    state_dict = loaded_checkpoint["generator"]
+  elif "state_dict" in loaded_checkpoint:
+    state_dict = loaded_checkpoint["state_dict"]
+  elif "model" in loaded_checkpoint and isinstance(loaded_checkpoint["model"], dict):
+    state_dict = loaded_checkpoint["model"]
+  else:
+    state_dict = loaded_checkpoint
+
+  if not isinstance(state_dict, dict):
+    raise ValueError("Could not find a tensor state dict in the Causal Forcing checkpoint.")
+  return state_dict
+
+
+def load_causal_forcing_transformer(
+    checkpoint_path: str,
+    eval_shapes: dict,
+    device: str,
+    num_layers: int = 40,
+    scan_layers: bool = True,
+):
+  """Loads an official Causal Forcing Stage 1 generator checkpoint."""
+  device = jax.local_devices(backend=device)[0]
+  with jax.default_device(device):
+    loaded_checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    loaded_state_dict = _extract_causal_forcing_generator_state_dict(loaded_checkpoint)
+
+    flax_state_dict = {}
+    cpu = jax.local_devices(backend="cpu")[0]
+    random_flax_state_dict = _build_random_flax_state_dict(eval_shapes)
+
+    for pt_key, tensor in loaded_state_dict.items():
+      if not hasattr(tensor, "shape"):
+        continue
+      tensor = torch2jax(tensor)
+      renamed_pt_key = rename_key(pt_key)
+      renamed_pt_key = rename_for_custom_trasformer(renamed_pt_key)
+      pt_tuple_key = tuple(renamed_pt_key.split("."))
+      flax_key, flax_tensor = get_key_and_value(
+          pt_tuple_key, tensor, flax_state_dict, random_flax_state_dict, scan_layers, num_layers
+      )
+      flax_state_dict[flax_key] = jax.device_put(jnp.asarray(flax_tensor), device=cpu)
+
+    validate_flax_state_dict(eval_shapes, flax_state_dict)
+    _validate_causal_forcing_state_dict(eval_shapes, flax_state_dict, checkpoint_path)
+    flax_state_dict = unflatten_dict(flax_state_dict)
+    max_logging.log(
+        f"Loaded Causal Forcing transformer checkpoint from {checkpoint_path} with {len(loaded_state_dict)} tensors."
+    )
+    jax.clear_caches()
+    return flax_state_dict
+
+
 def load_wan_transformer(
     pretrained_model_name_or_path: str,
     eval_shapes: dict,
@@ -274,7 +368,11 @@ def load_wan_transformer(
     scan_layers: bool = True,
     subfolder: str = "",
 ):
-  if pretrained_model_name_or_path == CAUSVID_TRANSFORMER_MODEL_NAME_OR_PATH:
+  if os.path.isfile(pretrained_model_name_or_path) and pretrained_model_name_or_path.endswith((".pt", ".pth")):
+    return load_causal_forcing_transformer(
+        pretrained_model_name_or_path, eval_shapes, device, num_layers=num_layers, scan_layers=scan_layers
+    )
+  elif pretrained_model_name_or_path == CAUSVID_TRANSFORMER_MODEL_NAME_OR_PATH:
     return load_causvid_transformer(pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers)
   elif pretrained_model_name_or_path == WAN_21_FUSION_X_MODEL_NAME_OR_PATH:
     return load_fusionx_transformer(pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers)
