@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from ...schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepScheduler
 import numpy as np
+import os
 import time
 from ... import max_utils
 from .wan_framewise_ar_utils import (
@@ -31,6 +32,27 @@ from .wan_framewise_ar_utils import (
     replace_latent_frame_block,
     reset_scheduler_state_for_ar_block,
 )
+
+
+# Sequence/length logical axes. Framewise AR denoises one tiny latent-frame block at a
+# time (e.g. 1560 tokens); context-parallelism over such a short sequence gives no speedup
+# AND corrupts attention — the per-context-shard length falls below the TPU lane-alignment
+# block (256 on v6e), making the splash attention/forward blow up to NaN. Replicating the
+# sequence makes the AR forward behave like ici_context_parallelism=1 (verified correct),
+# while batch (data/fsdp) and head (tensor) parallelism are preserved.
+_FRAMEWISE_AR_SEQ_AXES = (
+    "activation_length",
+    "activation_kv_length",
+    "activation_self_attn_q_length",
+    "activation_self_attn_kv_length",
+    "activation_cross_attn_q_length",
+    "activation_cross_attn_kv_length",
+)
+
+
+def _framewise_ar_replicated_axis_rules(rules):
+  """Map the sequence logical axes to None (replicated), leaving the rest unchanged."""
+  return tuple((name, None) if name in _FRAMEWISE_AR_SEQ_AXES else (name, target) for name, target in rules)
 
 
 class WanPipeline2_1(WanPipeline):
@@ -236,19 +258,31 @@ def run_inference_2_1(
   bsz = latents.shape[0]
 
   if getattr(config, "framewise_ar_inference", False):
-    return run_framewise_ar_inference_2_1(
-        graphdef=graphdef,
-        sharded_state=sharded_state,
-        rest_of_state=rest_of_state,
-        latents=latents,
-        prompt_embeds=prompt_embeds,
-        negative_prompt_embeds=negative_prompt_embeds,
-        guidance_scale=guidance_scale,
-        num_inference_steps=num_inference_steps,
-        scheduler=scheduler,
-        scheduler_state=scheduler_state,
-        config=config,
-    )
+    def _run_ar():
+      return run_framewise_ar_inference_2_1(
+          graphdef=graphdef,
+          sharded_state=sharded_state,
+          rest_of_state=rest_of_state,
+          latents=latents,
+          prompt_embeds=prompt_embeds,
+          negative_prompt_embeds=negative_prompt_embeds,
+          guidance_scale=guidance_scale,
+          num_inference_steps=num_inference_steps,
+          scheduler=scheduler,
+          scheduler_state=scheduler_state,
+          config=config,
+      )
+    # Framewise AR denoises one short latent-frame block at a time, so context
+    # parallelism gives no speedup AND corrupts the attention: the per-context-shard
+    # sequence falls below the TPU lane-alignment block (e.g. block=1 = 1560 tokens ->
+    # 195/shard at cp=8 < 256), making the context-sharded forward blow up to NaN. Run
+    # the AR forward with the sequence replicated (= ici_context_parallelism=1 behavior,
+    # verified correct); batch (data/fsdp) and head (tensor) parallelism are preserved.
+    # No-op when context parallelism is already 1. Set AR_DISABLE_REPL_FIX=1 to bypass.
+    if os.environ.get("AR_DISABLE_REPL_FIX"):
+      return _run_ar()
+    with nn_partitioning.axis_rules(_framewise_ar_replicated_axis_rules(config.logical_axis_rules)):
+      return _run_ar()
 
   # Resolution-dependent CFG cache config (FasterCache / MixCache guidance)
   if height >= 720:
