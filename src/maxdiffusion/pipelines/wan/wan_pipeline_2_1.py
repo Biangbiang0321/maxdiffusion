@@ -35,11 +35,17 @@ from .wan_framewise_ar_utils import (
 
 
 # Sequence/length logical axes. Framewise AR denoises one tiny latent-frame block at a
-# time (e.g. 1560 tokens); context-parallelism over such a short sequence gives no speedup
-# AND corrupts attention — the per-context-shard length falls below the TPU lane-alignment
-# block (256 on v6e), making the splash attention/forward blow up to NaN. Replicating the
-# sequence makes the AR forward behave like ici_context_parallelism=1 (verified correct),
-# while batch (data/fsdp) and head (tensor) parallelism are preserved.
+# time (e.g. block=1 = 1560 tokens); context-parallelism over such a short sequence gives
+# no speedup AND corrupts the forward when there is NO data parallelism. Empirically (TPU
+# v6e-8, 11-point mesh sweep): the garbage appears iff the sequence is context-sharded
+# (ici_context_parallelism>=2) AND ici_data_parallelism==1 — independent of the context
+# degree, batch size, and tensor degree. With data>=2 the same context-sharded forward is
+# correct; with data==1 GSPMD reshards the patch_embedding conv output wrongly, the bad
+# embedding propagates via the residual path and blows up to NaN -> grid garbage. (This is
+# NOT a per-shard-token / 256-lane / patch-row-alignment threshold; those were ruled out.)
+# Replicating the sequence makes the AR forward behave like ici_context_parallelism=1
+# (verified correct for ANY mesh), while batch (data/fsdp) and head (tensor) parallelism
+# are preserved.
 _FRAMEWISE_AR_SEQ_AXES = (
     "activation_length",
     "activation_kv_length",
@@ -272,13 +278,14 @@ def run_inference_2_1(
           scheduler_state=scheduler_state,
           config=config,
       )
-    # Framewise AR denoises one short latent-frame block at a time, so context
-    # parallelism gives no speedup AND corrupts the attention: the per-context-shard
-    # sequence falls below the TPU lane-alignment block (e.g. block=1 = 1560 tokens ->
-    # 195/shard at cp=8 < 256), making the context-sharded forward blow up to NaN. Run
-    # the AR forward with the sequence replicated (= ici_context_parallelism=1 behavior,
-    # verified correct); batch (data/fsdp) and head (tensor) parallelism are preserved.
-    # No-op when context parallelism is already 1. Set AR_DISABLE_REPL_FIX=1 to bypass.
+    # Framewise AR denoises one short latent-frame block at a time. Context-parallel
+    # sharding of that short sequence gives no speedup AND, when ici_data_parallelism==1,
+    # corrupts the forward: GSPMD reshards the patch_embedding conv output wrongly, which
+    # propagates through the residual path to NaN -> grid garbage. (Empirically the garbage
+    # is gated on data==1, NOT on a per-shard-token threshold; data>=2 is already clean.)
+    # Run the AR forward with the sequence replicated (= ici_context_parallelism=1 behavior,
+    # verified correct for any mesh); batch (data/fsdp) and head (tensor) parallelism are
+    # preserved. No-op when context parallelism is already 1. Set AR_DISABLE_REPL_FIX=1 to bypass.
     if os.environ.get("AR_DISABLE_REPL_FIX"):
       return _run_ar()
     with nn_partitioning.axis_rules(_framewise_ar_replicated_axis_rules(config.logical_axis_rules)):
