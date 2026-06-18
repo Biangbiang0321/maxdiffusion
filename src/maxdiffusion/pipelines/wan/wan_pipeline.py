@@ -103,7 +103,8 @@ def prompt_clean(text):
 
 
 def _add_sharding_rule(vs: nnx.VariableState, logical_axis_rules) -> nnx.VariableState:
-  vs.sharding_rules = logical_axis_rules
+  # flax >= 0.11 removed direct attribute assignment on Variable metadata; use set_metadata.
+  vs.set_metadata("sharding_rules", logical_axis_rules)
   return vs
 
 
